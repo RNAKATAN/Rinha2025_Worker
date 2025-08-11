@@ -3,7 +3,11 @@
     "Rinha2025_Worker": {
       "commandName": "Project",
       "environmentVariables": {
-        "DOTNET_ENVIRONMENT": "Development"
+        "DOTNET_ENVIRONMENT": "Development",
+        "PROCESSOR_DEFAULT_URL_BASE": "http://localhost:8001",
+        "PROCESSOR_FALLBACK_URL_BASE": "http://localhost:8002",
+        "REDIS_HOST": "localhost",
+        "REDIS_PORT": "6379"
       },
       "dotnetRunMessages": true
     },

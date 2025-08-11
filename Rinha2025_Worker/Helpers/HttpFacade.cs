@@ -29,7 +29,8 @@ namespace Rinha2025_Worker.Infra
                 PropertyNamingPolicy = JsonNamingPolicy.CamelCase
             };
 
-            var httpResponseMessage = await _httpClient.SendAsync(httpRequestMessage);
+
+            var httpResponseMessage = await _httpClient.SendAsync(httpRequestMessage); 
 
             if (httpResponseMessage.IsSuccessStatusCode)
             {
