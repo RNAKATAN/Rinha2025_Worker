@@ -4,6 +4,8 @@ using Rinha2025_Worker.Domain;
 using Rinha2025_Worker.Helpers;
 using Rinha2025_Worker.Infra;
 using StackExchange.Redis;
+using System.Linq.Expressions;
+using System.Runtime.CompilerServices;
 
 namespace Rinha2025_Worker
 {
@@ -104,29 +106,38 @@ namespace Rinha2025_Worker
         public async Task DequeueMessagesAsync(CancellationToken stoppingToken)
         {
             
-            int tamanho = 5;
+            int tamanho = 10;
 
-
+            SemaphoreSlim _semaforo = new SemaphoreSlim(6);
 
            do
             {
-                Console.WriteLine("FAZENDO O REDIS");
+
 
                 try
                 {
                     // Blocking pop from the left (head) of the list with a timeout
                     var result = await _db.ListLeftPopAsync("pagamentos", tamanho);
 
-                    Console.WriteLine("ANTES DO LENGTH");
+
+
+
 
                     if (result is not null && result.Length > 0)
                     {
                         Console.WriteLine("CHAMANDO O REDIS");
                         var tasks = result.Select(async (pagamento) =>
                         {
-
-                            PaymentInput paymentInput = JsonSerializerHelper<PaymentInput>.Deserialize(pagamento);
-                            await Processa(paymentInput);
+                            await _semaforo.WaitAsync(stoppingToken);
+                            try
+                            {
+                                PaymentInput paymentInput = JsonSerializerHelper<PaymentInput>.Deserialize(pagamento);
+                                await Processa(paymentInput);
+                            }
+                            finally
+                            {
+                                _semaforo.Release();
+                            }
 
                         });
 
@@ -142,29 +153,48 @@ namespace Rinha2025_Worker
 
         public async Task Processa(PaymentInput paymentInput)
         {
-            string urlProcessorDefault = $"{Environment.GetEnvironmentVariable("PROCESSOR_DEFAULT_URL_BASE")!}/payments";
-            string urlProcessorFallback = $"{Environment.GetEnvironmentVariable("PROCESSOR_FALLBACK_URL_BASE")!}/payments";
 
-            if (await _db.StringGetAsync("DEFAULT") == 1)
+            try
             {
-                HttpRequestMessage request = new HttpRequestMessageBuilder()
-                    .AddUrl(urlProcessorDefault)
 
-                    .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ConverteEmPaymentProcessorInput(paymentInput)))
-                    .AddMethod(HttpMethod.Post)
-                    .Build();
-                var respostaProcessamento = await _executaPagamentosUseCase.Processa(request);
+
+                string urlProcessorDefault = $"{Environment.GetEnvironmentVariable("PROCESSOR_DEFAULT_URL_BASE")!}/payments";
+                string urlProcessorFallback = $"{Environment.GetEnvironmentVariable("PROCESSOR_FALLBACK_URL_BASE")!}/payments";
+
+                if (await _db.StringGetAsync("DEFAULT") == 1)
+                {
+                    HttpRequestMessage request = new HttpRequestMessageBuilder()
+                        .AddUrl(urlProcessorDefault)
+
+                        .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ConverteEmPaymentProcessorInput(paymentInput)))
+                        .AddMethod(HttpMethod.Post)
+                        .Build();
+                    var respostaProcessamento = await _executaPagamentosUseCase.Processa(request);
+
+                }
+                else if (await _db.StringGetAsync("FALLBACK") == 1)
+                {
+                    HttpRequestMessage request = new HttpRequestMessageBuilder()
+                        .AddUrl(urlProcessorFallback)
+                        .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ConverteEmPaymentProcessorInput(paymentInput)))
+                        .AddMethod(HttpMethod.Post)
+                        .Build();
+                    var respostaProcessamento = await _executaPagamentosUseCase.Processa(request);
+                }
+                else
+                {
+                    await _db.ListLeftPushAsync("pagamentos", JsonSerializerHelper<PaymentInput>.Serialize(paymentInput));
+                    Console.WriteLine("Incluido na fila novamente. Os dois payment processor estao indisponiveis");
+                }
+
 
             }
-            else if (await _db.StringGetAsync("FALLBACK") == 1)
+            catch (Exception ex)
             {
-                HttpRequestMessage request = new HttpRequestMessageBuilder()
-                    .AddUrl(urlProcessorFallback)
-                    .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ConverteEmPaymentProcessorInput(paymentInput)))
-                    .AddMethod(HttpMethod.Post)
-                    .Build();
-                var respostaProcessamento = await _executaPagamentosUseCase.Processa(request);
+                await _db.ListLeftPushAsync("pagamentos", JsonSerializerHelper<PaymentInput>.Serialize(paymentInput));
+                Console.WriteLine("Incluido na fila novamente. Erro na chamada do payment processor");
             }
+
         }
 
         private PaymentProcessorInput ConverteEmPaymentProcessorInput(PaymentInput paymentInput)
