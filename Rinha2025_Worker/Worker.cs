@@ -1,210 +1,169 @@
-using Rinha2025_Api.Infra;
 using Rinha2025_Worker.Contratos;
 using Rinha2025_Worker.Domain;
 using Rinha2025_Worker.Helpers;
-using Rinha2025_Worker.Infra;
 using StackExchange.Redis;
-using System.Linq.Expressions;
-using System.Runtime.CompilerServices;
 
 namespace Rinha2025_Worker
 {
     public class Worker : BackgroundService
     {
-        private readonly ILogger<Worker> _logger;
-        private readonly IConnectionMultiplexer _redis;
-        private readonly IDatabase _db;
-        IHttpFacade<HealthCheck> _httpFacade;
-        private readonly IExecutaPagamentosUseCase _executaPagamentosUseCase;
+        private const int DequeueBatchSize = 8;
+        private const int MaxConcurrentPayments = 4;
+        private const int HealthCheckIntervalMs = 5000;
+        private const int EmptyQueueDelayMs = 50;
 
-        public Worker(ILogger<Worker> logger, IHttpFacade<HealthCheck> httpFacade, IExecutaPagamentosUseCase executaPagamentosUseCase, IConnectionMultiplexer redis)
+        private readonly ILogger<Worker> _logger;
+        private readonly IDatabase _db;
+        private readonly IHttpFacade<HealthCheck> _httpFacade;
+        private readonly IExecutaPagamentosUseCase _executaPagamentosUseCase;
+        private readonly string _urlProcessorDefault;
+        private readonly string _urlProcessorFallback;
+
+        public Worker(
+            ILogger<Worker> logger,
+            IHttpFacade<HealthCheck> httpFacade,
+            IExecutaPagamentosUseCase executaPagamentosUseCase,
+            IConnectionMultiplexer redis)
         {
-            _logger = logger;          
-            _redis = redis;
-            _db = _redis.GetDatabase();
+            _logger = logger;
+            _db = redis.GetDatabase();
             _httpFacade = httpFacade;
             _executaPagamentosUseCase = executaPagamentosUseCase;
-
-        }
-
-        private async Task SetaCacheHealthCheckAsync(string TipoProcessor, int Saudavel)
-        {
-
-            await _db.StringSetAsync(TipoProcessor, Saudavel);
-
+            _urlProcessorDefault = $"{Environment.GetEnvironmentVariable("PROCESSOR_DEFAULT_URL_BASE")!}/payments";
+            _urlProcessorFallback = $"{Environment.GetEnvironmentVariable("PROCESSOR_FALLBACK_URL_BASE")!}/payments";
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-
-
-           
-            Task TaskHealthCheckPayment = Task.Run(async () => await ValidaHealhCheckAsync(stoppingToken));
-
-            
-
-           Task TaskProcessaPagamentos = Task.Run(async () => await DequeueMessagesAsync(stoppingToken));
-
-
+            await Task.WhenAll(
+                ValidaHealthCheckAsync(stoppingToken),
+                DequeueMessagesAsync(stoppingToken)
+            );
         }
 
-        private async Task ValidaHealhCheckAsync(CancellationToken stoppingToken)
+        private async Task ValidaHealthCheckAsync(CancellationToken stoppingToken)
         {
-
-            Dictionary<string, string> HealthCheckDict = new Dictionary<string, string>
+            var endpoints = new Dictionary<string, string>
             {
-                ["DEFAULT"] = $"{Environment.GetEnvironmentVariable("PROCESSOR_DEFAULT_URL_BASE")!}/payments",
-                ["FALLBACK"] = $"{Environment.GetEnvironmentVariable("PROCESSOR_FALLBACK_URL_BASE")!}/payments"
+                ["DEFAULT"] = _urlProcessorDefault,
+                ["FALLBACK"] = _urlProcessorFallback
             };
 
-            //string urlProcessor = TipoProcessor == "DEFAULT" ?   $"{Environment.GetEnvironmentVariable("PROCESSOR_DEFAULT_URL_BASE")!}/payments" :  $"{Environment.GetEnvironmentVariable("PROCESSOR_FALLBACK_URL_BASE")!}/payments";
+            await _db.StringSetAsync("DEFAULT", 0);
+            await _db.StringSetAsync("FALLBACK", 0);
 
-            await SetaCacheHealthCheckAsync("DEFAULT", 0);
-            await SetaCacheHealthCheckAsync("FALLBACK", 0);
-
-            do
+            while (!stoppingToken.IsCancellationRequested)
             {
-                HealthCheck healthCheck = new HealthCheck();
-
-                foreach (var dict in HealthCheckDict)
+                foreach (var (key, url) in endpoints)
                 {
                     try
                     {
-                        healthCheck = await ChamaHealthCheckProcessor(dict.Value);
+                        var healthCheck = await CallHealthCheckAsync(url);
+                        var isHealthy = !healthCheck.Failing && healthCheck.MinResponseTime < 30;
+                        await _db.StringSetAsync(key, isHealthy ? 1 : 0);
                     }
                     catch (Exception ex)
                     {
-                        await SetaCacheHealthCheckAsync(dict.Key, 0);
-
-                    }
-
-                    if (!healthCheck.Failing && healthCheck.MinResponseTime < 30)
-                    {
-                        await SetaCacheHealthCheckAsync(dict.Key, 1);
-
-                    }
-                    else
-                    {
-                        await SetaCacheHealthCheckAsync(dict.Key, 0);
+                        _logger.LogWarning(ex, "Health check failed for {Processor}", key);
+                        await _db.StringSetAsync(key, 0);
                     }
                 }
-                ;
-                await Task.Delay(5000);
-            }while(!stoppingToken.IsCancellationRequested);
+
+                await Task.Delay(HealthCheckIntervalMs, stoppingToken);
+            }
         }
 
-        private async Task<HealthCheck> ChamaHealthCheckProcessor(string urlProcessor)
+        private async Task<HealthCheck> CallHealthCheckAsync(string paymentsUrl)
         {
-            HttpRequestMessage requestMessageHealthCheck = new HttpRequestMessageBuilder()
-            .AddUrl($"{urlProcessor}/service-health")
-            .AddMethod(HttpMethod.Get)
-            .Build();
+            var request = new HttpRequestMessageBuilder()
+                .AddUrl($"{paymentsUrl}/service-health")
+                .AddMethod(HttpMethod.Get)
+                .Build();
 
-            return await _httpFacade.ExecutaTarefa(requestMessageHealthCheck);
+            return await _httpFacade.ExecutaTarefa(request);
         }
 
-        public async Task DequeueMessagesAsync(CancellationToken stoppingToken)
+        private async Task DequeueMessagesAsync(CancellationToken stoppingToken)
         {
-            
-            int tamanho = 10;
+            var semaphore = new SemaphoreSlim(MaxConcurrentPayments);
 
-            SemaphoreSlim _semaforo = new SemaphoreSlim(6);
-
-           do
+            while (!stoppingToken.IsCancellationRequested)
             {
-
-
                 try
                 {
-                    // Blocking pop from the left (head) of the list with a timeout
-                    var result = await _db.ListLeftPopAsync("pagamentos", tamanho);
+                    var results = await _db.ListLeftPopAsync("pagamentos", DequeueBatchSize);
 
-
-
-
-
-                    if (result is not null && result.Length > 0)
+                    if (results is not null && results.Length > 0)
                     {
-                        Console.WriteLine("CHAMANDO O REDIS");
-                        var tasks = result.Select(async (pagamento) =>
+                        var tasks = results.Select(async item =>
                         {
-                            await _semaforo.WaitAsync(stoppingToken);
+                            await semaphore.WaitAsync(stoppingToken);
                             try
                             {
-                                PaymentInput paymentInput = JsonSerializerHelper<PaymentInput>.Deserialize(pagamento);
-                                await Processa(paymentInput);
+                                var paymentInput = JsonSerializerHelper<PaymentInput>.Deserialize(item!);
+                                await ProcessPaymentAsync(paymentInput);
                             }
                             finally
                             {
-                                _semaforo.Release();
+                                semaphore.Release();
                             }
-
                         });
 
                         await Task.WhenAll(tasks);
                     }
+                    else
+                    {
+                        await Task.Delay(EmptyQueueDelayMs, stoppingToken);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"erro: {ex.Message}");
+                    _logger.LogError(ex, "Error dequeuing payments");
                 }
-            }while (!stoppingToken.IsCancellationRequested);
+            }
         }
 
-        public async Task Processa(PaymentInput paymentInput)
+        private async Task ProcessPaymentAsync(PaymentInput paymentInput)
         {
-
             try
             {
-
-
-                string urlProcessorDefault = $"{Environment.GetEnvironmentVariable("PROCESSOR_DEFAULT_URL_BASE")!}/payments";
-                string urlProcessorFallback = $"{Environment.GetEnvironmentVariable("PROCESSOR_FALLBACK_URL_BASE")!}/payments";
+                string? targetUrl = null;
 
                 if (await _db.StringGetAsync("DEFAULT") == 1)
-                {
-                    HttpRequestMessage request = new HttpRequestMessageBuilder()
-                        .AddUrl(urlProcessorDefault)
-
-                        .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ConverteEmPaymentProcessorInput(paymentInput)))
-                        .AddMethod(HttpMethod.Post)
-                        .Build();
-                    var respostaProcessamento = await _executaPagamentosUseCase.Processa(request);
-
-                }
+                    targetUrl = _urlProcessorDefault;
                 else if (await _db.StringGetAsync("FALLBACK") == 1)
+                    targetUrl = _urlProcessorFallback;
+
+                if (targetUrl is null)
                 {
-                    HttpRequestMessage request = new HttpRequestMessageBuilder()
-                        .AddUrl(urlProcessorFallback)
-                        .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ConverteEmPaymentProcessorInput(paymentInput)))
-                        .AddMethod(HttpMethod.Post)
-                        .Build();
-                    var respostaProcessamento = await _executaPagamentosUseCase.Processa(request);
-                }
-                else
-                {
-                    await _db.ListLeftPushAsync("pagamentos", JsonSerializerHelper<PaymentInput>.Serialize(paymentInput));
-                    Console.WriteLine("Incluido na fila novamente. Os dois payment processor estao indisponiveis");
+                    await RequeueAsync(paymentInput);
+                    _logger.LogWarning("Both payment processors unavailable — requeued payment {CorrelationId}", paymentInput.CorrelationId);
+                    return;
                 }
 
+                var request = new HttpRequestMessageBuilder()
+                    .AddUrl(targetUrl)
+                    .AddBody(JsonSerializerHelper<PaymentProcessorInput>.Serialize(ToProcessorInput(paymentInput)))
+                    .AddMethod(HttpMethod.Post)
+                    .Build();
 
+                await _executaPagamentosUseCase.Processa(request);
             }
             catch (Exception ex)
             {
-                await _db.ListLeftPushAsync("pagamentos", JsonSerializerHelper<PaymentInput>.Serialize(paymentInput));
-                Console.WriteLine("Incluido na fila novamente. Erro na chamada do payment processor");
+                await RequeueAsync(paymentInput);
+                _logger.LogError(ex, "Payment processor call failed — requeued payment {CorrelationId}", paymentInput.CorrelationId);
             }
-
         }
 
-        private PaymentProcessorInput ConverteEmPaymentProcessorInput(PaymentInput paymentInput)
-        {
-            return new PaymentProcessorInput
-            {
-                Amount = paymentInput.Amount,
-                CorrelationId = paymentInput.CorrelationId
-            };
-        }
+        private async Task RequeueAsync(PaymentInput paymentInput) =>
+            await _db.ListLeftPushAsync("pagamentos", JsonSerializerHelper<PaymentInput>.Serialize(paymentInput));
 
+        private static PaymentProcessorInput ToProcessorInput(PaymentInput input) =>
+            new() { CorrelationId = input.CorrelationId, Amount = input.Amount };
     }
 }

@@ -1,36 +1,23 @@
-﻿using Rinha2025_Worker.Domain;
-using System.Net.Http;
-using System.Text.Json;
+﻿using System.Text.Json;
 
 namespace Rinha2025_Worker.Helpers
 {
-    public class JsonSerializerHelper<T>
+    public static class JsonSerializerHelper<T>
     {
-        public static string Serialize(T ObjetoEntrada)
+        private static readonly JsonSerializerOptions _serializeOptions = new()
         {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
 
-            var options = new JsonSerializerOptions
-            {              
-                WriteIndented = true
-            };
-
-
-            return JsonSerializer.Serialize(ObjetoEntrada, options);
-        }
-
-        public static T Deserialize(string TextoEntrada)
+        private static readonly JsonSerializerOptions _deserializeOptions = new()
         {
-            T objeto;
+            PropertyNameCaseInsensitive = true
+        };
 
-            var options = new JsonSerializerOptions
-            {
-              
-                WriteIndented = true
-            };
+        public static string Serialize(T input) =>
+            JsonSerializer.Serialize(input, _serializeOptions);
 
-
-            return JsonSerializer.Deserialize<T>(TextoEntrada, options);
-        }
-
+        public static T Deserialize(string input) =>
+            JsonSerializer.Deserialize<T>(input, _deserializeOptions)!;
     }
 }

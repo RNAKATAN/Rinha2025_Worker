@@ -1,8 +1,7 @@
-﻿namespace Rinha2025_Worker.Domain
+namespace Rinha2025_Worker.Domain
 {
     public class PaymentResponse
     {
-
-        public string Message { get; set; }
+        public string? Message { get; set; }
     }
 }

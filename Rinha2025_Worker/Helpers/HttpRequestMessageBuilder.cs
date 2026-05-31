@@ -1,6 +1,6 @@
 ﻿using System.Text;
 
-namespace Rinha2025_Api.Infra
+namespace Rinha2025_Worker.Helpers
 {
     public class HttpRequestMessageBuilder
     {
@@ -14,18 +14,6 @@ namespace Rinha2025_Api.Infra
         public HttpRequestMessage Build()
         {
             return _httpRequestMessage;
-        }
-
-        public HttpRequestMessageBuilder AddQueryParameters(string[] queryParameters)
-        {
-           if (queryParameters.Count() > 0)
-
-                //string url  = string.Concat(_httpRequestMessage.RequestUri.ToString(), "?");
-                foreach (string parameter in queryParameters)
-                {
-
-                }
-            return this;
         }
 
         public HttpRequestMessageBuilder AddUrl(string url)
@@ -52,7 +40,7 @@ namespace Rinha2025_Api.Infra
 
         public HttpRequestMessageBuilder AddBody(string body)
         {
-            _httpRequestMessage.Content = new  StringContent(body, Encoding.UTF8, "application/json");
+            _httpRequestMessage.Content = new StringContent(body, Encoding.UTF8, "application/json");
             return this;
         }
     }

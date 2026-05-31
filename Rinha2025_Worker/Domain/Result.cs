@@ -1,42 +1,30 @@
-﻿using static System.Runtime.InteropServices.JavaScript.JSType;
-
 namespace Rinha2025_Worker.Domain
 {
     public sealed record Error(string Code, string? Message = null);
+
     public class Result<TValue, TError>
     {
         public readonly TValue? Value;
         public readonly TError? Error;
 
-        private bool _isSuccess;
+        private readonly bool _isSuccess;
 
         private Result(TValue value)
         {
             _isSuccess = true;
-            value = value;
-           // error = default;
+            Value = value;
         }
 
         private Result(TError error)
         {
             _isSuccess = false;
-           // value = default;
-            error = error;
+            Error = error;
         }
 
-        //happy path
-        public static implicit operator Result<TValue, TError>(TValue value) => new Result<TValue, TError>(value);
+        public static implicit operator Result<TValue, TError>(TValue value) => new(value);
+        public static implicit operator Result<TValue, TError>(TError error) => new(error);
 
-        //error path
-        public static implicit operator Result<TValue, TError>(TError error) => new Result<TValue, TError>(error);
-
-        public Result<TValue, TError> Match(Func<TValue, Result<TValue, TError>> success, Func<TError, Result<TValue, TError>> failure)
-        {
-            if (_isSuccess)
-            {
-                return success(Value!);
-            }
-            return failure(Error!);
-        }
+        public TResult Match<TResult>(Func<TValue, TResult> success, Func<TError, TResult> failure) =>
+            _isSuccess ? success(Value!) : failure(Error!);
     }
 }
