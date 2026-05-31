@@ -11,6 +11,10 @@ namespace Rinha2025_Worker
         private const int MaxConcurrentPayments = 4;
         private const int HealthCheckIntervalMs = 5000;
         private const int EmptyQueueDelayMs = 50;
+        private const int RetryQueuePollMs = 500;
+        private const int MaxRetries = 5;
+        private const string PaymentQueueKey = "pagamentos";
+        private const string RetryQueueKey = "pagamentos:retry";
 
         private readonly ILogger<Worker> _logger;
         private readonly IDatabase _db;
@@ -37,7 +41,8 @@ namespace Rinha2025_Worker
         {
             await Task.WhenAll(
                 ValidaHealthCheckAsync(stoppingToken),
-                DequeueMessagesAsync(stoppingToken)
+                DequeueMessagesAsync(stoppingToken),
+                ProcessRetryQueueAsync(stoppingToken)
             );
         }
 
@@ -91,7 +96,7 @@ namespace Rinha2025_Worker
             {
                 try
                 {
-                    var results = await _db.ListLeftPopAsync("pagamentos", DequeueBatchSize);
+                    var results = await _db.ListLeftPopAsync(PaymentQueueKey, DequeueBatchSize);
 
                     if (results is not null && results.Length > 0)
                     {
@@ -127,6 +132,41 @@ namespace Rinha2025_Worker
             }
         }
 
+        private async Task ProcessRetryQueueAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    var due = await _db.SortedSetRangeByScoreAsync(RetryQueueKey, 0, nowMs);
+
+                    if (due.Length > 0)
+                    {
+                        foreach (var entry in due)
+                            await _db.ListRightPushAsync(PaymentQueueKey, entry);
+
+                        await _db.SortedSetRemoveRangeByScoreAsync(RetryQueueKey, 0, nowMs);
+
+                        _logger.LogInformation("Moved {Count} payment(s) from retry queue back to main queue", due.Length);
+                    }
+                    else
+                    {
+                        await Task.Delay(RetryQueuePollMs, stoppingToken);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error processing retry queue");
+                    await Task.Delay(RetryQueuePollMs, stoppingToken);
+                }
+            }
+        }
+
         private async Task ProcessPaymentAsync(PaymentInput paymentInput)
         {
             try
@@ -140,8 +180,7 @@ namespace Rinha2025_Worker
 
                 if (targetUrl is null)
                 {
-                    await RequeueAsync(paymentInput);
-                    _logger.LogWarning("Both payment processors unavailable — requeued payment {CorrelationId}", paymentInput.CorrelationId);
+                    await ScheduleRetryAsync(paymentInput, "both payment processors unavailable");
                     return;
                 }
 
@@ -155,13 +194,35 @@ namespace Rinha2025_Worker
             }
             catch (Exception ex)
             {
-                await RequeueAsync(paymentInput);
-                _logger.LogError(ex, "Payment processor call failed — requeued payment {CorrelationId}", paymentInput.CorrelationId);
+                await ScheduleRetryAsync(paymentInput, ex.Message);
             }
         }
 
-        private async Task RequeueAsync(PaymentInput paymentInput) =>
-            await _db.ListLeftPushAsync("pagamentos", JsonSerializerHelper<PaymentInput>.Serialize(paymentInput));
+        private async Task ScheduleRetryAsync(PaymentInput paymentInput, string reason)
+        {
+            paymentInput.RetryCount++;
+
+            if (paymentInput.RetryCount > MaxRetries)
+            {
+                _logger.LogError(
+                    "Payment {CorrelationId} exceeded {MaxRetries} retries — discarding. Last reason: {Reason}",
+                    paymentInput.CorrelationId, MaxRetries, reason);
+                return;
+            }
+
+            // 1s, 2s, 4s, 8s, 16s
+            var delayMs = (long)(Math.Pow(2, paymentInput.RetryCount - 1) * 1000);
+            var retryAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + delayMs;
+
+            await _db.SortedSetAddAsync(
+                RetryQueueKey,
+                JsonSerializerHelper<PaymentInput>.Serialize(paymentInput),
+                retryAtMs);
+
+            _logger.LogWarning(
+                "Payment {CorrelationId} scheduled for retry {Attempt}/{MaxRetries} in {DelayMs}ms. Reason: {Reason}",
+                paymentInput.CorrelationId, paymentInput.RetryCount, MaxRetries, delayMs, reason);
+        }
 
         private static PaymentProcessorInput ToProcessorInput(PaymentInput input) =>
             new() { CorrelationId = input.CorrelationId, Amount = input.Amount };

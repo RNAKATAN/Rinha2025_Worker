@@ -9,8 +9,7 @@ namespace Rinha2025_Worker.Domain
     {
         public string? CorrelationId { get; set; }
         public decimal Amount { get; set; }
-
-
+        public int RetryCount { get; set; }
     }
 
 
